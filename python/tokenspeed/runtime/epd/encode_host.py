@@ -336,7 +336,9 @@ class EncodeDataPlane:
             for item in request.items:
                 entry = (
                     self._cache.get(item.hash)
-                    if single and item.hash is not None
+                    if single
+                    and item.hash is not None
+                    and not self._encoder_owns_cache(item.modality)
                     else None
                 )
                 if item.feature_shm is not None:
@@ -358,6 +360,17 @@ class EncodeDataPlane:
         """Forget admitted requests that will not be encoded."""
         for admission in admissions:
             self._items.pop(admission, None)
+
+    def _encoder_owns_cache(self, modality) -> bool:
+        get_specs = getattr(self._model, "get_multimodal_encoder_specs", None)
+        if not callable(get_specs):
+            return False
+        spec = get_specs().get(modality)
+        return (
+            spec is not None
+            and spec.result_cache is not None
+            and spec.result_cache.enabled
+        )
 
     def _feature_fn(self, modality):
         get_specs = getattr(self._model, "get_multimodal_encoder_specs", None)
@@ -400,7 +413,7 @@ class EncodeDataPlane:
                 outcomes.append((admission, str(error)))
         if failure is None:
             for item in misses:
-                if item.hash is None:
+                if item.hash is None or self._encoder_owns_cache(item.modality):
                     continue
                 # Cache the pair: a later hit ships the deepstack rows too.
                 deep = item.encoded_deepstack

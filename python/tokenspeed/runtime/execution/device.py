@@ -1028,6 +1028,18 @@ class DeviceHandle:
             if state is not None:
                 require_complete = state.begin_update()
         try:
+            if loads_weights:
+                from tokenspeed.runtime.multimodal.embedder import (
+                    clear_multimodal_result_caches,
+                )
+
+                models = (
+                    self._mooncake_update_models()
+                    if type(req) is UpdateWeightsFromMooncakeReqInput
+                    else [runner.model]
+                )
+                for model in models:
+                    clear_multimodal_result_caches(model)
             result = handler(req)
             if loads_weights and result[0] and self._executor.drafter is not None:
                 self._executor.drafter.on_target_weights_updated()

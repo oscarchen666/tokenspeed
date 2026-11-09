@@ -412,3 +412,80 @@ def test_npu_encode_lands_rows_on_selected_device():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+class _CachedTower(_Tower):
+    def __init__(self, capacity):
+        super().__init__()
+        from tokenspeed.runtime.cache.tensor_cache import HostTensorCache
+
+        self.result_cache = HostTensorCache(capacity)
+        self.bias = 0
+
+    def image_encoder(self, items):
+        outputs = []
+        for item in items:
+            value = self.result_cache.get(item.hash, device=torch.device("cpu"))
+            if value is None:
+                value = super().image_encoder([item]) + self.bias
+                self.result_cache.put(item.hash, value)
+            outputs.append(value)
+        return torch.cat(outputs)
+
+    def get_multimodal_encoder_specs(self):
+        return {
+            Modality.IMAGE: EncoderSpec(
+                self.image_encoder, result_cache=self.result_cache
+            )
+        }
+
+
+def test_encoder_owned_cache_does_not_leave_stale_epd_results():
+    from tokenspeed.runtime.multimodal.embedder import clear_multimodal_result_caches
+
+    tower = _CachedTower(1024)
+    plane, ring = _plane(tower)
+    for admission in (1, 2):
+        assert plane.admit([(admission, _frames(_item(7, 1)))]) == [False]
+        plane.encode([(admission, 0)])
+        plane.encoded()
+        assert torch.equal(_slot(ring, 0, 1), torch.full((1, HIDDEN), 7.0))
+    assert tower.calls == [[7]]
+    tower.bias = 10
+    clear_multimodal_result_caches(tower)
+    assert plane.admit([(3, _frames(_item(7, 1)))]) == [False]
+    plane.encode([(3, 0)])
+    plane.encoded()
+    assert torch.equal(_slot(ring, 0, 1), torch.full((1, HIDDEN), 17.0))
+    assert tower.calls == [[7], [7]]
+
+
+def test_disabled_encoder_cache_preserves_outer_epd_cache():
+    tower = _CachedTower(0)
+    plane, ring = _plane(tower)
+    plane.admit([(1, _frames(_item(7, 1)))])
+    plane.encode([(1, 0)])
+    plane.encoded()
+    assert plane.admit([(2, _frames(_item(7, 1)))]) == [True]
+    plane.encode([(2, 1)])
+    plane.encoded()
+    assert tower.calls == [[7]]
+    assert torch.equal(_slot(ring, 1, 1), torch.full((1, HIDDEN), 7.0))
+
+
+def test_encoder_cache_pressure_clear_and_cancel_cycles():
+    tower = _CachedTower(288)
+    plane, ring = _plane(tower)
+    for admission in range(200):
+        key = admission % 7
+        plane.admit([(admission, _frames(_item(key, 1)))])
+        if admission % 5 == 0:
+            plane.release([admission])
+        else:
+            plane.encode([(admission, 0)])
+            assert len(plane.encoded()) == 1
+            assert torch.equal(_slot(ring, 0, 1), torch.full((1, HIDDEN), float(key)))
+        if admission % 11 == 0:
+            tower.result_cache.clear()
+        assert tower.result_cache.current_bytes <= 288
+    assert tower.result_cache.snapshot()["evictions"] > 0

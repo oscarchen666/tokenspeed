@@ -695,3 +695,42 @@ def _local_weight_update_group(monkeypatch):
     # These CPU adapter tests lack a process group; the multiprocess session
     # regression exercises real rank agreement and collective post-load hooks.
     monkeypatch.setattr(pg_manager, "get_process_group", lambda *a, **kw: None)
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "exception"])
+def test_weight_write_invalidates_target_and_refreshed_draft_results(outcome):
+    from tokenspeed.runtime.cache.tensor_cache import HostTensorCache
+    from tokenspeed.runtime.multimodal.embedder import EncoderSpec
+    from tokenspeed.runtime.multimodal.inputs import Modality
+
+    class Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cache = HostTensorCache(1024)
+            self.cache.put("old", torch.ones(1))
+
+        def forward(self, items):
+            return torch.ones(1)
+
+        def get_multimodal_encoder_specs(self):
+            return {Modality.IMAGE: EncoderSpec(self.forward, result_cache=self.cache)}
+
+    executor = _executor(draft_policy="refresh", with_draft=True)
+    target, draft = Encoder(), Encoder()
+    executor.model_runner.model = target
+    executor.draft_model_runner.model = draft
+
+    def write(version, models, **kwargs):
+        assert models == [target, draft]
+        for model in models:
+            assert model.cache.get("old", device=torch.device("cpu")) is None
+        if outcome == "exception":
+            raise RuntimeError("partial weight write")
+        return outcome == "success", outcome
+
+    executor.model_runner.update_weights_from_mooncake.side_effect = write
+    ok, _ = DeviceHandle(executor).update_weights(_mooncake_req(3))
+    assert ok is (outcome == "success")
+    for model in (target, draft):
+        assert model.cache.current_bytes == 0
+        assert model.cache.generation == 1

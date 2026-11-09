@@ -32,6 +32,7 @@ implementation detail.
 """
 
 import hashlib
+import struct
 from collections.abc import Iterable
 
 import numpy as np
@@ -54,11 +55,13 @@ def _fold(chunks: Iterable[ByteChunk]) -> int:
 
 
 def _raw_bytes(buffer: torch.Tensor | np.ndarray) -> memoryview:
-    """Contiguous byte view of a tensor/array; CUDA tensors are pulled to host."""
+    """Contiguous byte view of a tensor/array; device tensors are pulled to host."""
     if isinstance(buffer, torch.Tensor):
-        if buffer.is_cuda:
+        if buffer.device.type != "cpu":
             buffer = buffer.cpu()
-        return memoryview(buffer.detach().contiguous().view(torch.uint8).numpy())
+        return memoryview(
+            buffer.detach().contiguous().reshape(-1).view(torch.uint8).numpy()
+        )
     return memoryview(np.ascontiguousarray(buffer))
 
 
@@ -82,3 +85,22 @@ def hash_feature(feature) -> int:
         return _fold([feature])
 
     return _fold([repr(feature).encode()])
+
+
+def tensor_content_digest(*tensors: torch.Tensor) -> bytes:
+    """SHA-256 of ordered tensor dtype, shape and bytes, independent of storage.
+
+    Producers compute this before device transport. Include every layout tensor
+    used by the encoder. The wire representation is a sequence of little-endian
+    uint64 dtype lengths, dtype bytes, ranks, dimensions, then contiguous bytes.
+    """
+    digest = hashlib.sha256(b"tokenspeed-encoder-cache-v1\0")
+    for tensor in tensors:
+        dtype = str(tensor.dtype).removeprefix("torch.").encode("ascii")
+        digest.update(struct.pack("<Q", len(dtype)))
+        digest.update(dtype)
+        digest.update(struct.pack("<Q", tensor.ndim))
+        for size in tensor.shape:
+            digest.update(struct.pack("<Q", size))
+        digest.update(_raw_bytes(tensor))
+    return digest.digest()

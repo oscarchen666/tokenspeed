@@ -69,6 +69,7 @@ from typing import Any, cast
 import torch
 from torch import nn
 
+from tokenspeed.runtime.cache.tensor_cache import HostTensorCache
 from tokenspeed.runtime.distributed.mapping import VisionTowerMapping
 from tokenspeed.runtime.distributed.process_group_manager import (
     process_group_manager,
@@ -132,6 +133,20 @@ class EncoderSpec:
     fn: EncoderFn
     deepstack: bool = False
     make_warmup_items: EncoderWarmupItemsFactory | None = None
+    result_cache: HostTensorCache | None = None
+
+
+def clear_multimodal_result_caches(model: Any) -> None:
+    """Invalidate registered results on the owner forward thread before weight writes."""
+    get_specs = getattr(model, "get_multimodal_encoder_specs", None)
+    if not callable(get_specs):
+        return
+    seen = set()
+    for spec in get_specs().values():
+        cache = spec.result_cache
+        if cache is not None and id(cache) not in seen:
+            cache.clear()
+            seen.add(id(cache))
 
 
 def warmup_multimodal_encoders(
